@@ -38,7 +38,7 @@ An optional final section turns the offline renderer into a fully local,
 turn-by-turn conversational prototype. It records a question in the browser,
 transcribes it with multilingual faster-whisper, generates a short reply with
 Qwen3-1.7B, synthesizes that reply in the recorded voice with Chatterbox
-Multilingual V3, and feeds the result back through AVTR-1. These models run in
+Multilingual, and feeds the result back through AVTR-1. These models run in
 the Colab runtime and do not call hosted inference APIs. The interface switches
 between English and Dutch without reloading Qwen or AVTR. The first
 conversational turn loads the already-downloaded models into GPU memory and is

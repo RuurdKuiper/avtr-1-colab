@@ -36,7 +36,7 @@ SYSTEM_PROMPT = (
 TTS_REPO_ID = "ResembleAI/chatterbox"
 TTS_ALLOW_PATTERNS = [
     "ve.pt",
-    "t3_mtl23ls_v3.safetensors",
+    "t3_mtl23ls_v2.safetensors",
     "s3gen.pt",
     "grapheme_mtl_merged_expanded_v1.json",
     "conds.pt",
@@ -225,11 +225,13 @@ class AvatarServer:
                 allow_patterns=TTS_ALLOW_PATTERNS,
                 token=os.getenv("HF_TOKEN") or None,
             )
+            # chatterbox-tts 0.1.7 loads the multilingual V2 checkpoint by
+            # default. Its from_local() predates the newer t3_model selector.
             self._tts = ChatterboxMultilingualTTS.from_local(
-                local_path, device="cuda", t3_model="v3"
+                local_path, device="cuda"
             )
             print(
-                f"Loaded Chatterbox Multilingual V3 in "
+                f"Loaded Chatterbox Multilingual in "
                 f"{time.perf_counter() - started:.1f}s",
                 flush=True,
             )
