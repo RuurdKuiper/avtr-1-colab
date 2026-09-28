@@ -37,18 +37,24 @@ camera access is unavailable.
 An optional final section turns the offline renderer into a fully local,
 turn-by-turn conversational prototype. It records a question in the browser,
 transcribes it with multilingual faster-whisper, generates a short reply with
-Qwen3-1.7B, synthesizes that reply in the recorded voice with Chatterbox
+Qwen3-4B-Instruct-2507, synthesizes that reply in the recorded voice with Chatterbox
 Multilingual, and feeds the result back through AVTR-1. These models run in
 the Colab runtime and do not call hosted inference APIs. The interface switches
-between English and Dutch without reloading Qwen or AVTR. The first
-conversational turn loads the already-downloaded models into GPU memory and is
-therefore substantially slower than later turns.
+between English and Dutch without reloading Qwen or AVTR. On A100, the notebook
+uses the BF16 model: the similarly named fine-grained FP8 checkpoint needs an
+H100-class GPU for native FP8 kernels. Set the optional `LLM_MODEL` Colab secret
+to override the checkpoint.
 
 The Gradio notebook wraps the same stages in one persistent server and keeps
-the speech, language, voice, and AVTR renderer models warm between turns. AVTR
-runs in a persistent isolated Pixi worker: the first answer loads its pipeline
-and registers the portrait, while later answers reuse both. A new enrollment is
-registered on demand without rebuilding the pipeline. Its share URL is a tunnel
+the speech, language, voice, and AVTR renderer models warm between turns. Its
+Kiosk tab first shows a silent browser-camera mirror. Stopping an 8–15 second
+voice recording captures the latest camera frame, conditions the voice, registers
+the avatar, and replaces the mirror with the persistent avatar conversation view.
+The reusable models are preloaded before the share URL opens. Each enrollment and
+conversation turn displays a timing table for speech recognition, LLM generation,
+voice conditioning/synthesis, and avatar rendering, plus peak GPU memory for the
+conversational process. AVTR runs in a persistent isolated Pixi worker, so new
+enrollments do not rebuild its pipeline. Its share URL is a tunnel
 to the current Colab process, not a deployment: it stops when the cell or
 runtime stops. Browser media passes through the Gradio share tunnel to the
 Colab runtime, so use the generated password and do not treat the URL as a
@@ -77,8 +83,9 @@ simulation.
   GPU changes.
 - The first run is the slow one because dependencies, weights, and engines all
   need to be prepared.
-- This notebook demonstrates offline generation and optional turn-by-turn
-  conversation, not the low-latency WebRTC live demo.
+- The kiosk is a continuous visual experience, but conversation remains
+  push-to-talk and turn-based. It waits for a complete TTS waveform and rendered
+  MP4; it is not yet the low-latency WebRTC/live-streaming backend.
 - Colab runtimes are temporary. Download the resulting MP4 before disconnecting.
 - The model, renderer, streamer, and InsightFace dependency have different
   license conditions. Review the repository license files before use, and only

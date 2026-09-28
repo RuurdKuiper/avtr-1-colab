@@ -100,6 +100,20 @@ def main() -> None:
     print("Persistent renderer: loading AVTR pipeline once...", flush=True)
     pipeline, _ = Pipeline.from_artifacts(avatar_ids=None)
     avatars: OrderedDict[str, Avatar] = OrderedDict()
+
+    def load_avatar(avatar_id: str, portrait_path: Path) -> Avatar:
+        avatar = avatars.pop(avatar_id, None)
+        if avatar is None:
+            print(f"Persistent renderer: registering avatar {avatar_id!r}...", flush=True)
+            avatar = pipeline.load_avatar(portrait_path, avatar_id=avatar_id)
+        avatars[avatar_id] = avatar
+        while len(avatars) > MAX_CACHED_AVATARS:
+            evicted_id, evicted_avatar = avatars.popitem(last=False)
+            del evicted_avatar
+            torch.cuda.empty_cache()
+            print(f"Persistent renderer: evicted avatar {evicted_id!r}.", flush=True)
+        return avatar
+
     print("Persistent renderer: ready for jobs.", flush=True)
     _emit({"event": "ready"})
 
@@ -114,26 +128,27 @@ def main() -> None:
             if request.get("command") == "shutdown":
                 _emit({"id": request_id, "ok": True})
                 return
-            if request.get("command") != "render":
+            if request.get("command") == "evict_avatar":
+                avatar = avatars.pop(str(request["avatar_id"]), None)
+                if avatar is not None:
+                    del avatar
+                    torch.cuda.empty_cache()
+                _emit({"id": request_id, "ok": True})
+                continue
+            if request.get("command") not in {"load_avatar", "render"}:
                 raise ValueError(f"Unknown command: {request.get('command')!r}")
 
             avatar_id = str(request["avatar_id"])
             portrait_path = Path(request["portrait"]).resolve()
+            avatar = load_avatar(avatar_id, portrait_path)
+            if request.get("command") == "load_avatar":
+                _emit({"id": request_id, "ok": True})
+                continue
+
             speech_path = Path(request["speech"]).resolve()
             output_path = Path(request["output"]).resolve()
             if not speech_path.is_file():
                 raise FileNotFoundError(f"Speech audio not found: {speech_path}")
-
-            avatar = avatars.pop(avatar_id, None)
-            if avatar is None:
-                print(f"Persistent renderer: registering avatar {avatar_id!r}...", flush=True)
-                avatar = pipeline.load_avatar(portrait_path, avatar_id=avatar_id)
-            avatars[avatar_id] = avatar
-            while len(avatars) > MAX_CACHED_AVATARS:
-                evicted_id, evicted_avatar = avatars.popitem(last=False)
-                del evicted_avatar
-                torch.cuda.empty_cache()
-                print(f"Persistent renderer: evicted avatar {evicted_id!r}.", flush=True)
 
             result = _render(
                 pipeline,

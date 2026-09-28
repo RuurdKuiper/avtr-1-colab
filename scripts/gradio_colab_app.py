@@ -43,6 +43,7 @@ TTS_ALLOW_PATTERNS = [
     "Cangjie5_TC.json",
 ]
 PORTRAIT_SIZE = (1280, 720)
+MIN_ENROLLMENT_SECONDS = 8.0
 LANGUAGES = {
     "English": {
         "code": "en",
@@ -85,6 +86,7 @@ class AvatarServer:
         self._tts_reference: str | None = None
         self._renderer_process: subprocess.Popen[str] | None = None
         self._renderer_logs: deque[str] = deque(maxlen=80)
+        self._model_load_timings: dict[str, float] = {}
         atexit.register(self.close)
 
     def close(self) -> None:
@@ -163,12 +165,110 @@ class AvatarServer:
             str(voice_out),
         )
 
-    def reset(self, state: dict[str, Any] | None) -> tuple[dict[str, Any], list, str, str, None, None]:
+    def kiosk_enroll(
+        self,
+        portrait_path: str | None,
+        voice_path: str | None,
+        progress: gr.Progress = gr.Progress(),
+    ) -> tuple[dict[str, Any], str, str | None, Any, Any, str]:
+        """Finish the mirror phase and reveal the enrolled avatar."""
+        started = time.perf_counter()
+        if voice_path:
+            duration = self._audio_duration(Path(voice_path))
+            if duration < MIN_ENROLLMENT_SECONDS:
+                raise gr.Error(
+                    f"Keep talking a little longer: {duration:.1f}s recorded, "
+                    f"but at least {MIN_ENROLLMENT_SECONDS:.0f}s is needed."
+                )
+        progress(0.05, desc="Saving your portrait and voice")
+        state, _, portrait, _ = self.enroll(portrait_path, voice_path)
+        saved_at = time.perf_counter()
+        with self._gpu_lock:
+            progress(0.20, desc="Preparing the local models")
+            cold_loads = self._load_models(progress)
+            progress(0.65, desc="Learning the voice reference")
+            voice_time = self._prepare_voice_reference(state["voice_reference"])
+            progress(0.80, desc="Preparing the avatar")
+            avatar_started = time.perf_counter()
+            self._prepare_avatar(
+                avatar_id=state["avatar_id"],
+                portrait=Path(state["registered_portrait"]),
+            )
+            avatar_time = time.perf_counter() - avatar_started
+        total = time.perf_counter() - started
+        enrollment_timings = {
+            "Save portrait and audio": saved_at - started,
+            **{
+                f"Cold {name.removeprefix('load_')} load": value
+                for name, value in cold_loads.items()
+            },
+            "Voice conditioning": voice_time,
+            "Avatar registration": avatar_time,
+            "Enrollment total": total,
+        }
+        profile = "### Enrollment profile\n\n| Stage | Time |\n|---|---:|\n" + "\n".join(
+            f"| {name} | {value:.2f}s |" for name, value in enrollment_timings.items()
+        )
+        progress(1.0, desc="Avatar ready")
+        return (
+            state,
+            f"Voice captured. Your avatar is ready ({duration:.1f}s reference).",
+            portrait,
+            gr.update(visible=False),
+            gr.update(visible=True),
+            profile,
+        )
+
+    def reset(
+        self, state: dict[str, Any] | None
+    ) -> tuple[dict[str, Any], list, str, str, None, None]:
         if state:
             state = dict(state)
             state["history"] = []
             state["turn"] = 0
         return state or {}, [], "", "", None, None
+
+    def restart_kiosk(self, state: dict[str, Any] | None) -> tuple[Any, ...]:
+        """Delete one visitor's temporary media and return to the mirror."""
+        if state:
+            avatar_id = state.get("avatar_id")
+            if (
+                avatar_id
+                and self._renderer_process is not None
+                and self._renderer_process.poll() is None
+            ):
+                with self._gpu_lock:
+                    try:
+                        self._renderer_request(
+                            {
+                                "id": uuid.uuid4().hex,
+                                "command": "evict_avatar",
+                                "avatar_id": avatar_id,
+                            }
+                        )
+                    except RendererWorkerDied:
+                        self.close()
+            registered = state.get("registered_portrait")
+            if registered:
+                Path(registered).unlink(missing_ok=True)
+            session_dir = state.get("session_dir")
+            if session_dir:
+                shutil.rmtree(session_dir, ignore_errors=True)
+            if self._tts_reference == state.get("voice_reference"):
+                self._tts_reference = None
+        return (
+            {},
+            gr.update(visible=True),
+            gr.update(visible=False),
+            "### Look into the camera\nRecord at least 8 seconds of natural speech.",
+            None,
+            None,
+            None,
+            [],
+            "",
+            "",
+            "",
+        )
 
     def _convert_audio(self, source: Path, destination: Path, *, sample_rate: int) -> None:
         ffmpeg = shutil.which("ffmpeg")
@@ -192,7 +292,30 @@ class AvatarServer:
         if result.returncode:
             raise RuntimeError(f"Could not decode the audio: {result.stderr[-1200:]}")
 
-    def _load_models(self, progress: gr.Progress) -> None:
+    def _audio_duration(self, source: Path) -> float:
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            raise RuntimeError("ffprobe is not installed in the Colab runtime")
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(source),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode:
+            raise RuntimeError(f"Could not inspect the audio: {result.stderr[-1200:]}")
+        return float(result.stdout.strip())
+
+    def _load_models(self, progress: gr.Progress) -> dict[str, float]:
+        loaded_now: dict[str, float] = {}
         if self._stt is None:
             started = time.perf_counter()
             progress(0.05, desc="Loading speech recognition")
@@ -201,7 +324,10 @@ class AvatarServer:
             self._stt = WhisperModel(
                 self.stt_model_name, device="cuda", compute_type="float16"
             )
-            print(f"Loaded {self.stt_model_name} in {time.perf_counter() - started:.1f}s", flush=True)
+            elapsed = time.perf_counter() - started
+            loaded_now["load_stt"] = elapsed
+            self._model_load_timings["load_stt"] = elapsed
+            print(f"Loaded {self.stt_model_name} in {elapsed:.1f}s", flush=True)
         if self._tokenizer is None or self._llm is None:
             started = time.perf_counter()
             progress(0.12, desc="Loading conversational model")
@@ -213,7 +339,10 @@ class AvatarServer:
                 torch_dtype="auto",
                 device_map="auto",
             )
-            print(f"Loaded {self.llm_model_name} in {time.perf_counter() - started:.1f}s", flush=True)
+            elapsed = time.perf_counter() - started
+            loaded_now["load_llm"] = elapsed
+            self._model_load_timings["load_llm"] = elapsed
+            print(f"Loaded {self.llm_model_name} in {elapsed:.1f}s", flush=True)
         if self._tts is None:
             started = time.perf_counter()
             progress(0.20, desc="Loading voice-cloning model")
@@ -230,11 +359,11 @@ class AvatarServer:
             self._tts = ChatterboxMultilingualTTS.from_local(
                 local_path, device="cuda"
             )
-            print(
-                f"Loaded Chatterbox Multilingual in "
-                f"{time.perf_counter() - started:.1f}s",
-                flush=True,
-            )
+            elapsed = time.perf_counter() - started
+            loaded_now["load_tts"] = elapsed
+            self._model_load_timings["load_tts"] = elapsed
+            print(f"Loaded Chatterbox Multilingual in {elapsed:.1f}s", flush=True)
+        return loaded_now
 
     def _transcribe(self, audio_path: str, language_code: str) -> str:
         segments, _ = self._stt.transcribe(
@@ -260,7 +389,6 @@ class AvatarServer:
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False,
         )
         inputs = self._tokenizer([prompt], return_tensors="pt").to(self._llm.device)
         with torch.inference_mode():
@@ -284,26 +412,60 @@ class AvatarServer:
         reference: str,
         output: Path,
         language_code: str,
-    ) -> None:
+    ) -> dict[str, float]:
+        timings = {"voice_conditioning": 0.0}
         reference = str(Path(reference).resolve())
         with torch.inference_mode():
             if self._tts_reference != reference:
-                started = time.perf_counter()
-                print("Encoding the voice reference (once for this enrollment)...", flush=True)
-                self._tts.prepare_conditionals(reference, exaggeration=0.5)
-                self._tts_reference = reference
-                print(
-                    f"Voice reference encoded in {time.perf_counter() - started:.1f}s; "
-                    "subsequent turns will reuse it.",
-                    flush=True,
-                )
+                timings["voice_conditioning"] = self._prepare_voice_reference(reference)
             started = time.perf_counter()
             # Omitting audio_prompt_path makes Chatterbox reuse self.conds
             # instead of re-reading and re-encoding the same reference clip.
             wav = self._tts.generate(reply, language_id=language_code)
-            print(f"Synthesized reply in {time.perf_counter() - started:.1f}s", flush=True)
+            timings["tts"] = time.perf_counter() - started
+            print(f"Synthesized reply in {timings['tts']:.1f}s", flush=True)
         ta.save(str(output), wav.cpu(), self._tts.sr)
         del wav
+        return timings
+
+    def _prepare_voice_reference(self, reference: str) -> float:
+        reference = str(Path(reference).resolve())
+        if self._tts_reference == reference:
+            return 0.0
+        started = time.perf_counter()
+        print("Encoding the voice reference (once for this enrollment)...", flush=True)
+        with torch.inference_mode():
+            self._tts.prepare_conditionals(reference, exaggeration=0.5)
+        self._tts_reference = reference
+        elapsed = time.perf_counter() - started
+        print(
+            f"Voice reference encoded in {elapsed:.1f}s; subsequent turns will reuse it.",
+            flush=True,
+        )
+        return elapsed
+
+    def _prepare_avatar(self, *, avatar_id: str, portrait: Path) -> None:
+        response = self._renderer_request(
+            {
+                "id": uuid.uuid4().hex,
+                "command": "load_avatar",
+                "avatar_id": avatar_id,
+                "portrait": str(portrait.resolve()),
+            }
+        )
+        if not response.get("ok"):
+            raise RuntimeError(
+                f"AVTR avatar preparation failed: {response.get('error', 'unknown worker error')}"
+            )
+
+    def warmup(self) -> None:
+        """Load all reusable models before admitting the first visitor."""
+        started = time.perf_counter()
+        print("Preloading conversational models before opening the kiosk...", flush=True)
+        with self._gpu_lock:
+            self._load_models(lambda *args, **kwargs: None)
+            self._ensure_renderer_worker()
+        print(f"Kiosk model warmup finished in {time.perf_counter() - started:.1f}s.", flush=True)
 
     def _render(
         self,
@@ -314,7 +476,8 @@ class AvatarServer:
         output: Path,
         cfg_self_audio: float,
         noise_trunc_z: float,
-    ) -> None:
+    ) -> dict[str, float]:
+        request_started = time.perf_counter()
         request = {
             "id": uuid.uuid4().hex,
             "command": "render",
@@ -335,10 +498,14 @@ class AvatarServer:
                     )
                 print(
                     f"Persistent renderer produced {response['frames']} frames in "
-                    f"{response['elapsed']:.1f}s.",
+                    f"{response['elapsed']:.1f}s "
+                    f"({response['elapsed'] / response['seconds']:.2f}x real time).",
                     flush=True,
                 )
-                return
+                return {
+                    "renderer_total": time.perf_counter() - request_started,
+                    "renderer_inference": float(response["elapsed"]),
+                }
             except RendererWorkerDied:
                 self.close()
                 if attempt == 0:
@@ -360,6 +527,61 @@ class AvatarServer:
             message = self._read_renderer_message(process)
             if message.get("id") == request["id"]:
                 return message
+
+    @staticmethod
+    def _timing_report(timings: dict[str, float]) -> str:
+        labels = {
+            "load_stt": "Cold load · speech recognition",
+            "load_llm": "Cold load · language model",
+            "load_tts": "Cold load · voice model",
+            "stt": "Speech recognition",
+            "llm": "Language model",
+            "voice_conditioning": "Voice enrollment (first turn only)",
+            "tts": "Voice synthesis",
+            "renderer_total": "Avatar render (including startup/avatar load)",
+            "renderer_inference": "Avatar render core",
+            "total": "Total turn",
+        }
+        rows = [
+            f"| {labels.get(name, name)} | {seconds:.2f}s |"
+            for name, seconds in timings.items()
+        ]
+        peak = max(
+            ((name, seconds) for name, seconds in timings.items() if name != "total"),
+            key=lambda item: item[1],
+            default=("total", timings.get("total", 0.0)),
+        )
+        gpu = ""
+        if torch.cuda.is_available():
+            allocated = torch.cuda.max_memory_allocated() / (1024**3)
+            reserved = torch.cuda.max_memory_reserved() / (1024**3)
+            gpu = (
+                f"\n\nPeak GPU memory this process: **{allocated:.1f} GB allocated / "
+                f"{reserved:.1f} GB reserved**."
+            )
+            nvidia_smi = shutil.which("nvidia-smi")
+            if nvidia_smi:
+                result = subprocess.run(
+                    [
+                        nvidia_smi,
+                        "--query-gpu=memory.used,memory.total",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    used, total = result.stdout.splitlines()[0].split(",")
+                    gpu += (
+                        " Total GPU use across both processes: "
+                        f"**{used.strip()} / {total.strip()} MiB**."
+                    )
+        return (
+            f"Slowest measured stage: **{labels.get(peak[0], peak[0])} ({peak[1]:.2f}s)**\n\n"
+            "| Stage | Time |\n|---|---:|\n"
+            + "\n".join(rows)
+            + gpu
+        )
 
     def _ensure_renderer_worker(self) -> subprocess.Popen[str]:
         process = self._renderer_process
@@ -424,7 +646,7 @@ class AvatarServer:
         cfg_self_audio: float,
         noise_trunc_z: float,
         progress: gr.Progress = gr.Progress(),
-    ) -> tuple[str, str, str, str, list[dict[str, str]], dict[str, Any]]:
+    ) -> tuple[str, str, str, str, list[dict[str, str]], dict[str, Any], str]:
         if not state or not state.get("voice_reference"):
             raise gr.Error("Enroll a portrait and voice before starting a conversation.")
         if not question_audio:
@@ -437,17 +659,23 @@ class AvatarServer:
         # AVTR/TensorRT and the conversational models all share one GPU.
         with self._gpu_lock:
             try:
-                self._load_models(progress)
+                turn_started = time.perf_counter()
+                torch.cuda.reset_peak_memory_stats()
+                timings = self._load_models(progress)
                 progress(0.28, desc="Transcribing your question")
+                started = time.perf_counter()
                 question = self._transcribe(question_audio, language_code)
+                timings["stt"] = time.perf_counter() - started
                 if not question:
                     raise gr.Error("No speech was detected. Please record the question again.")
 
                 progress(0.42, desc="Writing a response")
                 history = list(state.get("history", []))[-8:]
+                started = time.perf_counter()
                 reply = self._respond(
                     question, history, language_config["instruction"]
                 )
+                timings["llm"] = time.perf_counter() - started
                 if not reply:
                     raise RuntimeError("The language model returned an empty reply")
 
@@ -457,23 +685,27 @@ class AvatarServer:
                 reply_video = session_dir / f"reply_{turn_number:03d}.mp4"
 
                 progress(0.58, desc="Cloning the voice")
-                self._synthesize(
-                    reply,
-                    state["voice_reference"],
-                    reply_audio,
-                    language_code,
+                timings.update(
+                    self._synthesize(
+                        reply,
+                        state["voice_reference"],
+                        reply_audio,
+                        language_code,
+                    )
                 )
                 gc.collect()
                 torch.cuda.empty_cache()
 
                 progress(0.72, desc="Rendering the avatar video")
-                self._render(
-                    avatar_id=state["avatar_id"],
-                    portrait=Path(state["registered_portrait"]),
-                    speech=reply_audio,
-                    output=reply_video,
-                    cfg_self_audio=cfg_self_audio,
-                    noise_trunc_z=noise_trunc_z,
+                timings.update(
+                    self._render(
+                        avatar_id=state["avatar_id"],
+                        portrait=Path(state["registered_portrait"]),
+                        speech=reply_audio,
+                        output=reply_video,
+                        cfg_self_audio=cfg_self_audio,
+                        noise_trunc_z=noise_trunc_z,
+                    )
                 )
 
                 history.extend(
@@ -485,6 +717,23 @@ class AvatarServer:
                 state = dict(state)
                 state["history"] = history[-8:]
                 state["turn"] = turn_number
+                timings["total"] = time.perf_counter() - turn_started
+                with (session_dir / "timings.jsonl").open("a", encoding="utf-8") as metrics:
+                    metrics.write(
+                        json.dumps(
+                            {
+                                "turn": turn_number,
+                                "language": language_code,
+                                "question_chars": len(question),
+                                "reply_chars": len(reply),
+                                "timings_seconds": timings,
+                            },
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    )
+                profile = self._timing_report(timings)
+                print(profile, flush=True)
                 progress(1.0, desc="Done")
                 return (
                     question,
@@ -493,73 +742,239 @@ class AvatarServer:
                     str(reply_video),
                     history,
                     state,
+                    profile,
                 )
             except gr.Error:
                 raise
             except Exception as exc:
                 raise gr.Error(str(exc)) from exc
 
+    def kiosk_turn(
+        self,
+        question_audio: str | None,
+        state: dict[str, Any] | None,
+        language: str,
+        cfg_self_audio: float,
+        noise_trunc_z: float,
+        progress: gr.Progress = gr.Progress(),
+    ) -> tuple[Any, ...]:
+        """Conversation turn plus the kiosk's still-to-video transition."""
+        result = self.turn(
+            question_audio,
+            state,
+            language,
+            cfg_self_audio,
+            noise_trunc_z,
+            progress,
+        )
+        video_path = result[3]
+        return (
+            *result[:3],
+            gr.update(value=video_path, visible=True),
+            *result[4:],
+            gr.update(visible=False),
+        )
+
 
 def build_ui(server: AvatarServer) -> gr.Blocks:
-    with gr.Blocks(title="Local AVTR-1 conversational avatar") as demo:
+    webcam_options = (
+        {
+            "webcam_options": gr.WebcamOptions(
+                mirror=True,
+                constraints={
+                    "facingMode": "user",
+                    "width": {"ideal": 1280},
+                    "height": {"ideal": 720},
+                    "aspectRatio": {"ideal": 16 / 9},
+                },
+            )
+        }
+        if hasattr(gr, "WebcamOptions")
+        else {"mirror_webcam": True}
+    )
+    with gr.Blocks(
+        title="Local AVTR-1 conversational avatar",
+        css="""
+        .kiosk-stage { max-width: 1100px; margin: 0 auto; }
+        .kiosk-stage video, .kiosk-stage img { max-height: 70vh; object-fit: contain; }
+        """,
+    ) as demo:
         state = gr.State({})
         gr.Markdown(
             "# Conversational AVTR-1 avatar\n"
-            "Everything is inferred in this Colab runtime. First enroll a portrait and "
-            "voice sample, then use push-to-talk turns. Only use a face and voice with "
-            "the person's explicit consent."
+            "Everything is inferred in this Colab runtime. The Kiosk tab is the installation "
+            "flow; the Manual controls tab is useful for testing. Only use a face and voice "
+            "with the person's explicit consent."
         )
 
-        with gr.Tab("1. Enroll portrait and voice"):
-            with gr.Row():
-                portrait = gr.Image(
-                    label="Portrait",
-                    sources=["webcam", "upload"],
+        with gr.Tab("Kiosk experience"):
+            kiosk_status = gr.Markdown(
+                "### Look into the camera\n"
+                "Start the camera, then record at least 8 seconds of natural speech. "
+                "Your microphone recording is not played back. Stopping the recording "
+                "automatically creates the avatar."
+            )
+            with gr.Group(visible=True, elem_classes="kiosk-stage") as mirror_stage:
+                kiosk_camera = gr.Image(
+                    label="Live mirror",
+                    sources=["webcam"],
                     type="filepath",
+                    streaming=True,
+                    **webcam_options,
                 )
-                voice_reference = gr.Audio(
-                    label="Clean 8–15 second voice sample",
-                    sources=["microphone", "upload"],
+                latest_kiosk_frame = gr.Image(type="filepath", visible=False)
+                kiosk_voice = gr.Audio(
+                    label="Record 8–15 seconds, then press stop",
+                    sources=["microphone"],
                     type="filepath",
                     format="wav",
                 )
-            enroll_button = gr.Button("Save portrait and voice", variant="primary")
-            enrollment_status = gr.Textbox(label="Status", interactive=False)
-            saved_portrait = gr.Image(label="Saved portrait", interactive=False)
-            saved_voice = gr.Audio(label="Saved voice reference", interactive=False)
+            with gr.Group(visible=False, elem_classes="kiosk-stage") as avatar_stage:
+                kiosk_still = gr.Image(
+                    label="Your avatar",
+                    interactive=False,
+                )
+                kiosk_video = gr.Video(
+                    label="Your avatar",
+                    autoplay=True,
+                    visible=False,
+                )
+                kiosk_question = gr.Audio(
+                    label="Ask the avatar a question, then press stop",
+                    sources=["microphone"],
+                    type="filepath",
+                    format="wav",
+                )
+                kiosk_language = gr.Radio(
+                    choices=list(LANGUAGES),
+                    value="English",
+                    label="Conversation language / Gesprekstaal",
+                )
+                kiosk_transcript = gr.Textbox(label="Visitor", interactive=False)
+                kiosk_response = gr.Textbox(label="Avatar", interactive=False)
+                kiosk_chat = gr.Chatbot(label="Conversation")
+                kiosk_response_audio = gr.Audio(visible=False)
+                with gr.Accordion("Performance profile", open=False):
+                    kiosk_profile = gr.Markdown()
+                with gr.Accordion("Motion tuning", open=False):
+                    kiosk_cfg = gr.Slider(
+                        1.5, 3.5, value=2.7, step=0.1, label="Speech guidance"
+                    )
+                    kiosk_noise = gr.Slider(
+                        0.8, 1.7, value=1.5, step=0.1, label="Motion range"
+                    )
+                kiosk_restart = gr.Button("Finish and welcome the next visitor")
 
-        with gr.Tab("2. Conversation"):
-            language = gr.Radio(
-                choices=list(LANGUAGES),
-                value="English",
-                label="Conversation language / Gesprekstaal",
-            )
-            gr.Markdown(
-                "Use a voice-reference recording in the selected language for the "
-                "most natural accent. Switching languages does not reload AVTR or Qwen."
-            )
-            question_audio = gr.Audio(
-                label="Record a question",
-                sources=["microphone", "upload"],
-                type="filepath",
-                format="wav",
-            )
-            ask_button = gr.Button("Ask avatar", variant="primary")
-            with gr.Accordion("Motion tuning", open=False):
-                cfg_self_audio = gr.Slider(
-                    1.5, 3.5, value=2.7, step=0.1, label="Speech guidance"
-                )
-                noise_trunc_z = gr.Slider(
-                    0.8, 1.7, value=1.5, step=0.1, label="Motion range"
-                )
+        with gr.Tab("Manual controls"):
+            with gr.Row():
+                with gr.Column():
+                    portrait = gr.Image(
+                        label="Portrait",
+                        sources=["webcam", "upload"],
+                        type="filepath",
+                    )
+                    voice_reference = gr.Audio(
+                        label="Clean 8–15 second voice sample",
+                        sources=["microphone", "upload"],
+                        type="filepath",
+                        format="wav",
+                    )
+                    enroll_button = gr.Button("Save portrait and voice", variant="primary")
+                    enrollment_status = gr.Textbox(label="Status", interactive=False)
+                    saved_portrait = gr.Image(label="Saved portrait", interactive=False)
+                    saved_voice = gr.Audio(label="Saved voice reference", interactive=False)
+                with gr.Column():
+                    language = gr.Radio(
+                        choices=list(LANGUAGES),
+                        value="English",
+                        label="Conversation language / Gesprekstaal",
+                    )
+                    question_audio = gr.Audio(
+                        label="Record a question",
+                        sources=["microphone", "upload"],
+                        type="filepath",
+                        format="wav",
+                    )
+                    ask_button = gr.Button("Ask avatar", variant="primary")
+                    with gr.Accordion("Motion tuning", open=False):
+                        cfg_self_audio = gr.Slider(
+                            1.5, 3.5, value=2.7, step=0.1, label="Speech guidance"
+                        )
+                        noise_trunc_z = gr.Slider(
+                            0.8, 1.7, value=1.5, step=0.1, label="Motion range"
+                        )
             with gr.Row():
                 transcript = gr.Textbox(label="You", interactive=False)
                 response = gr.Textbox(label="Avatar", interactive=False)
             with gr.Row():
                 response_audio = gr.Audio(label="Cloned response", interactive=False)
-                response_video = gr.Video(label="Rendered avatar", interactive=False)
+                response_video = gr.Video(
+                    label="Rendered avatar", interactive=False, autoplay=True
+                )
             chat = gr.Chatbot(label="Conversation")
+            with gr.Accordion("Performance profile", open=False):
+                profile = gr.Markdown()
             reset_button = gr.Button("Clear conversation history")
+
+        # The browser owns the live camera view. Colab samples it at a low rate
+        # and retains only the latest frame for enrollment.
+        kiosk_camera.stream(
+            lambda frame: frame,
+            inputs=kiosk_camera,
+            outputs=latest_kiosk_frame,
+            stream_every=0.5,
+            time_limit=120,
+            concurrency_limit=4,
+            api_visibility="private",
+        )
+        kiosk_voice.stop_recording(
+            server.kiosk_enroll,
+            inputs=[latest_kiosk_frame, kiosk_voice],
+            outputs=[
+                state,
+                kiosk_status,
+                kiosk_still,
+                mirror_stage,
+                avatar_stage,
+                kiosk_profile,
+            ],
+            concurrency_limit=1,
+            api_visibility="private",
+        )
+        kiosk_question.stop_recording(
+            server.kiosk_turn,
+            inputs=[kiosk_question, state, kiosk_language, kiosk_cfg, kiosk_noise],
+            outputs=[
+                kiosk_transcript,
+                kiosk_response,
+                kiosk_response_audio,
+                kiosk_video,
+                kiosk_chat,
+                state,
+                kiosk_profile,
+                kiosk_still,
+            ],
+            concurrency_limit=1,
+            api_visibility="private",
+        )
+        kiosk_restart.click(
+            server.restart_kiosk,
+            inputs=[state],
+            outputs=[
+                state,
+                mirror_stage,
+                avatar_stage,
+                kiosk_status,
+                kiosk_voice,
+                kiosk_still,
+                kiosk_video,
+                kiosk_chat,
+                kiosk_transcript,
+                kiosk_response,
+                kiosk_profile,
+            ],
+            api_visibility="private",
+        )
 
         enroll_button.click(
             server.enroll,
@@ -570,7 +985,7 @@ def build_ui(server: AvatarServer) -> gr.Blocks:
         ask_button.click(
             server.turn,
             inputs=[question_audio, state, language, cfg_self_audio, noise_trunc_z],
-            outputs=[transcript, response, response_audio, response_video, chat, state],
+            outputs=[transcript, response, response_audio, response_video, chat, state, profile],
             concurrency_limit=1,
             api_visibility="private",
         )
@@ -591,15 +1006,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--work-dir", type=Path, default=Path("/content/avtr_gradio_sessions")
     )
-    parser.add_argument("--llm-model", default="Qwen/Qwen3-1.7B")
+    parser.add_argument("--llm-model", default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--stt-model", default="small")
+    parser.add_argument(
+        "--no-preload",
+        action="store_true",
+        help="Open the UI before loading models (makes the first visitor wait).",
+    )
     parser.add_argument("--no-share", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    print(f"Server preflight: Python {sys.version.split()[0]} | Gradio {gr.__version__} | PyTorch {torch.__version__}", flush=True)
+    print(
+        f"Server preflight: Python {sys.version.split()[0]} | "
+        f"Gradio {gr.__version__} | PyTorch {torch.__version__}",
+        flush=True,
+    )
     print(f"Repository: {args.repo}\nStorage: {args.storage}", flush=True)
     if not torch.cuda.is_available():
         raise RuntimeError("This app requires a Colab GPU runtime")
@@ -612,6 +1036,8 @@ def main() -> None:
         llm_model=args.llm_model,
         stt_model=args.stt_model,
     )
+    if not args.no_preload:
+        server.warmup()
     demo = build_ui(server)
     print("Gradio interface constructed successfully; opening share tunnel...", flush=True)
     username = os.environ.get("GRADIO_USERNAME", "avatar")
