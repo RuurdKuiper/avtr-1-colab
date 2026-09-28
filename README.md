@@ -33,6 +33,12 @@
 2. [Performance](#2-performance)
 3. [Troubleshooting](#troubleshooting)
 
+> **Apple Silicon / Google Colab:** the current runtime requires Linux and an
+> NVIDIA CUDA GPU; Docker Desktop on macOS does not provide that GPU backend.
+> See [COLAB.md](COLAB.md) for an offline Colab proof of concept and a
+> ready-to-run Gradio notebook, including a no-inference-API voice-cloned
+> conversational interface.
+
 ---
 
 ## 1. 🚀 Quick Start
@@ -99,10 +105,17 @@ pixi run interactive-demo
 **Single speaker.** Avatar lip-syncs the given audio track.
 
 ```bash
-pixi run generate_offline --speech example/speaker_1.ogg
+pixi run generate_offline --speech example/speaker_1.ogg --bg plain_white
 
-# with a custom avatar and background:
+# with a bundled avatar and background:
 pixi run generate_offline --speech example/speaker_1.ogg --avatar maria --bg minimal_office
+
+# with a custom portrait PNG:
+pixi run generate_offline --speech example/speaker_1.ogg --portrait person.png --bg plain_white
+
+# somewhat livelier speech-driven head motion (tune conservatively):
+pixi run generate_offline --speech example/speaker_1.ogg --avatar maria --bg plain_white \
+  --cfg-self-audio 2.7 --noise-trunc-z 1.5
 ```
 
 **Two-speaker dialogue.** Avatar voices `--speech` and reacts (active listening) to the peer audio on `--listen`. Run twice with the tracks swapped to render both sides of the conversation.

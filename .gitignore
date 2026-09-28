@@ -52,6 +52,7 @@ _metadata
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
+!colab/*.ipynb
 
 # Locks (pixi.lock is committed; others are not)
 *.lock

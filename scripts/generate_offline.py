@@ -7,6 +7,7 @@ Downloads any missing models from HuggingFace on first run.
 
 Usage:
     pixi run generate_offline --speech path/to/speech.mp3 --bg plain_white
+    pixi run generate_offline --portrait path/to/person.png --speech s.wav --bg plain_white
     pixi run generate_offline --speech s.wav --listen l.wav --bg plain_white
     pixi run generate_offline --duration 10 --bg plain_white                          # 10 s silence
     pixi run generate_offline --speech s.wav --bg plain_white --no-mux                # video only
@@ -107,8 +108,34 @@ def main() -> None:
     parser.add_argument("--duration", type=float, default=None,
                         help="Force render duration in seconds; audio is trimmed/padded to fit")
     parser.add_argument("--avatar", default="maria", help="Avatar ID to render")
+    parser.add_argument(
+        "--portrait",
+        type=Path,
+        default=None,
+        help="Custom portrait PNG. When set, its filename stem is used as the avatar ID.",
+    )
     parser.add_argument("--out", type=Path, default=Path("demo_output.mp4"))
     parser.add_argument("--bg", required=True, help="Background ID (must match a file in the backgrounds artifact, e.g. 'plain_white')")
+    parser.add_argument(
+        "--cfg-self-audio", type=float, default=2.0,
+        help="Speech-conditioning guidance (default: 2.0; try 2.5-3.0 for livelier motion)",
+    )
+    parser.add_argument(
+        "--cfg-other-audio", type=float, default=2.0,
+        help="Listening-track guidance (default: 2.0)",
+    )
+    parser.add_argument(
+        "--cfg-kp", type=float, default=3.0,
+        help="Source keypoint guidance (default: 3.0)",
+    )
+    parser.add_argument(
+        "--noise-alpha", type=float, default=2.0,
+        help="Temporal correlation of generated motion (default: 2.0)",
+    )
+    parser.add_argument(
+        "--noise-trunc-z", type=float, default=1.2,
+        help="Range of stochastic motion (default: 1.2; try 1.5-1.7 for livelier motion)",
+    )
     parser.add_argument(
         "--no-mux", dest="mux", action="store_false",
         help="Don't mux the speech audio into the output video.",
@@ -133,10 +160,18 @@ def main() -> None:
         f"listen={'set' if args.listen else 'silence'})"
     )
 
-    print(f"Loading pipeline for avatar '{args.avatar}'...")
+    avatar_id = args.portrait.stem if args.portrait is not None else args.avatar
+    portraits_dir = args.portrait.parent if args.portrait is not None else None
+    if args.portrait is not None and not args.portrait.is_file():
+        parser.error(f"Custom portrait does not exist: {args.portrait}")
+
+    print(f"Loading pipeline for avatar '{avatar_id}'...")
     print("  (models are downloaded from HuggingFace on first run — this may take a few minutes)")
-    pipeline, registry = Pipeline.from_artifacts(avatar_ids=[args.avatar])
-    avatar = registry[args.avatar]
+    pipeline, registry = Pipeline.from_artifacts(
+        avatar_ids=[avatar_id],
+        portraits_dir=portraits_dir,
+    )
+    avatar = registry[avatar_id]
 
     window = _chunk_window(pipeline)
     step = _chunk_step(pipeline)
@@ -168,7 +203,16 @@ def main() -> None:
 
     mode = "streaming" if args.stream_frames else "batched"
     print(f"Render mode: {mode}")
-    options = RenderOptions(pixel_format="yuv_i420", bg_id=args.bg, stream_frames=args.stream_frames)
+    options = RenderOptions(
+        pixel_format="yuv_i420",
+        bg_id=args.bg,
+        cfg_self_audio=args.cfg_self_audio,
+        cfg_other_audio=args.cfg_other_audio,
+        cfg_kp=args.cfg_kp,
+        noise_alpha=args.noise_alpha,
+        noise_trunc_z=args.noise_trunc_z,
+        stream_frames=args.stream_frames,
+    )
     state = None
     produced = 0
     chunk_times: list[float] = []
