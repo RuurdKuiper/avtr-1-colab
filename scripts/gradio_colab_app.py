@@ -8,6 +8,7 @@ renders in its own Pixi environment so its TensorRT/PyTorch pins stay isolated.
 from __future__ import annotations
 
 import argparse
+import atexit
 import gc
 import json
 import os
@@ -17,6 +18,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -31,8 +33,30 @@ SYSTEM_PROMPT = (
     "spoken sentences. Use plain text without markdown, lists, stage directions, "
     "or emoji."
 )
-TTS_REPO_ID = "ResembleAI/chatterbox-turbo"
-TTS_ALLOW_PATTERNS = ["ve.safetensors", "t3_turbo_v1.safetensors", "s3gen_meanflow.safetensors", "conds.pt", "*.json", "*.txt", "*.model"]
+TTS_REPO_ID = "ResembleAI/chatterbox"
+TTS_ALLOW_PATTERNS = [
+    "ve.pt",
+    "t3_mtl23ls_v3.safetensors",
+    "s3gen.pt",
+    "grapheme_mtl_merged_expanded_v1.json",
+    "conds.pt",
+    "Cangjie5_TC.json",
+]
+PORTRAIT_SIZE = (1280, 720)
+LANGUAGES = {
+    "English": {
+        "code": "en",
+        "instruction": "Reply only in natural spoken English.",
+    },
+    "Nederlands": {
+        "code": "nl",
+        "instruction": "Antwoord uitsluitend in natuurlijk gesproken Nederlands.",
+    },
+}
+
+
+class RendererWorkerDied(RuntimeError):
+    """Raised when the persistent renderer exits before replying."""
 
 
 class AvatarServer:
@@ -58,6 +82,23 @@ class AvatarServer:
         self._tokenizer = None
         self._llm = None
         self._tts = None
+        self._tts_reference: str | None = None
+        self._renderer_process: subprocess.Popen[str] | None = None
+        self._renderer_logs: deque[str] = deque(maxlen=80)
+        atexit.register(self.close)
+
+    def close(self) -> None:
+        """Release the renderer subprocess when the Gradio server exits."""
+        process = self._renderer_process
+        self._renderer_process = None
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
     def _reference_frames_dir(self) -> Path:
         matches = sorted(self.storage.glob("*/avatars_artifacts/reference_frames"))
@@ -88,6 +129,15 @@ class AvatarServer:
         try:
             with Image.open(portrait_path) as image:
                 image = ImageOps.exif_transpose(image).convert("RGB")
+                # Match the renderer's 16:9 canvas without changing facial
+                # proportions. The saved-preview component shows this exact
+                # crop, so the user can retake/reframe before starting.
+                image = ImageOps.fit(
+                    image,
+                    PORTRAIT_SIZE,
+                    method=Image.Resampling.LANCZOS,
+                    centering=(0.5, 0.5),
+                )
                 image.save(portrait_out, format="PNG")
             shutil.copy2(portrait_out, registered_portrait)
             self._convert_audio(Path(voice_path), voice_out, sample_rate=24_000)
@@ -167,22 +217,40 @@ class AvatarServer:
         if self._tts is None:
             started = time.perf_counter()
             progress(0.20, desc="Loading voice-cloning model")
-            from chatterbox.tts_turbo import ChatterboxTurboTTS
+            from chatterbox.mtl_tts import ChatterboxMultilingualTTS
             from huggingface_hub import snapshot_download
 
-            local_path = snapshot_download(repo_id=TTS_REPO_ID, allow_patterns=TTS_ALLOW_PATTERNS, token=os.getenv("HF_TOKEN") or None)
-            self._tts = ChatterboxTurboTTS.from_local(local_path, device="cuda")
-            print(f"Loaded Chatterbox Turbo in {time.perf_counter() - started:.1f}s", flush=True)
+            local_path = snapshot_download(
+                repo_id=TTS_REPO_ID,
+                allow_patterns=TTS_ALLOW_PATTERNS,
+                token=os.getenv("HF_TOKEN") or None,
+            )
+            self._tts = ChatterboxMultilingualTTS.from_local(
+                local_path, device="cuda", t3_model="v3"
+            )
+            print(
+                f"Loaded Chatterbox Multilingual V3 in "
+                f"{time.perf_counter() - started:.1f}s",
+                flush=True,
+            )
 
-    def _transcribe(self, audio_path: str) -> str:
+    def _transcribe(self, audio_path: str, language_code: str) -> str:
         segments, _ = self._stt.transcribe(
-            audio_path, beam_size=5, vad_filter=True
+            audio_path, beam_size=5, vad_filter=True, language=language_code
         )
         return " ".join(segment.text.strip() for segment in segments).strip()
 
-    def _respond(self, question: str, history: list[dict[str, str]]) -> str:
+    def _respond(
+        self,
+        question: str,
+        history: list[dict[str, str]],
+        language_instruction: str,
+    ) -> str:
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": f"{SYSTEM_PROMPT} {language_instruction}",
+            },
             *history[-8:],
             {"role": "user", "content": question},
         ]
@@ -208,9 +276,30 @@ class AvatarServer:
         del inputs, generated, reply_ids
         return reply
 
-    def _synthesize(self, reply: str, reference: str, output: Path) -> None:
+    def _synthesize(
+        self,
+        reply: str,
+        reference: str,
+        output: Path,
+        language_code: str,
+    ) -> None:
+        reference = str(Path(reference).resolve())
         with torch.inference_mode():
-            wav = self._tts.generate(reply, audio_prompt_path=reference)
+            if self._tts_reference != reference:
+                started = time.perf_counter()
+                print("Encoding the voice reference (once for this enrollment)...", flush=True)
+                self._tts.prepare_conditionals(reference, exaggeration=0.5)
+                self._tts_reference = reference
+                print(
+                    f"Voice reference encoded in {time.perf_counter() - started:.1f}s; "
+                    "subsequent turns will reuse it.",
+                    flush=True,
+                )
+            started = time.perf_counter()
+            # Omitting audio_prompt_path makes Chatterbox reuse self.conds
+            # instead of re-reading and re-encoding the same reference clip.
+            wav = self._tts.generate(reply, language_id=language_code)
+            print(f"Synthesized reply in {time.perf_counter() - started:.1f}s", flush=True)
         ta.save(str(output), wav.cpu(), self._tts.sr)
         del wav
 
@@ -218,55 +307,118 @@ class AvatarServer:
         self,
         *,
         avatar_id: str,
+        portrait: Path,
         speech: Path,
         output: Path,
         cfg_self_audio: float,
         noise_trunc_z: float,
     ) -> None:
-        wrapper = f"""
-import importlib.util
-from pathlib import Path
-spec = importlib.util.spec_from_file_location('avtr1_generate_offline', Path('scripts/generate_offline.py'))
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-default_render_options = module.RenderOptions
-def tuned_render_options(**kwargs):
-    kwargs.update(cfg_self_audio={float(cfg_self_audio)}, noise_trunc_z={float(noise_trunc_z)})
-    return default_render_options(**kwargs)
-module.RenderOptions = tuned_render_options
-module.main()
-"""
+        request = {
+            "id": uuid.uuid4().hex,
+            "command": "render",
+            "avatar_id": avatar_id,
+            "portrait": str(portrait.resolve()),
+            "speech": str(speech.resolve()),
+            "output": str(output.resolve()),
+            "cfg_self_audio": float(cfg_self_audio),
+            "noise_trunc_z": float(noise_trunc_z),
+        }
+
+        for attempt in range(2):
+            try:
+                response = self._renderer_request(request)
+                if not response.get("ok"):
+                    raise RuntimeError(
+                        f"AVTR rendering failed: {response.get('error', 'unknown worker error')}"
+                    )
+                print(
+                    f"Persistent renderer produced {response['frames']} frames in "
+                    f"{response['elapsed']:.1f}s.",
+                    flush=True,
+                )
+                return
+            except RendererWorkerDied:
+                self.close()
+                if attempt == 0:
+                    print("Renderer worker stopped unexpectedly; restarting once...", flush=True)
+                    continue
+                raise
+
+    def _renderer_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        process = self._ensure_renderer_worker()
+        if process.stdin is None:
+            raise RendererWorkerDied("Renderer worker stdin is unavailable")
+        try:
+            process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise RendererWorkerDied("Could not send a job to the renderer worker") from exc
+
+        while True:
+            message = self._read_renderer_message(process)
+            if message.get("id") == request["id"]:
+                return message
+
+    def _ensure_renderer_worker(self) -> subprocess.Popen[str]:
+        process = self._renderer_process
+        if process is not None and process.poll() is None:
+            return process
+
         env = os.environ.copy()
         env["AVTR1_LOCAL_STORAGE"] = str(self.storage)
-        result = subprocess.run(
+        env["PYTHONUNBUFFERED"] = "1"
+        self._renderer_logs.clear()
+        print("Starting persistent AVTR renderer (one-time model load)...", flush=True)
+        process = subprocess.Popen(
             [
                 str(self.pixi),
                 "run",
                 "python",
-                "-c",
-                wrapper,
-                "--avatar",
-                avatar_id,
-                "--speech",
-                str(speech),
-                "--bg",
-                "plain_white",
-                "--out",
-                str(output),
+                "scripts/gradio_renderer_worker.py",
             ],
             cwd=self.repo,
             env=env,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
+            bufsize=1,
         )
-        if result.returncode:
-            details = (result.stderr or result.stdout)[-3000:]
-            raise RuntimeError(f"AVTR rendering failed:\n{details}")
+        self._renderer_process = process
+        while True:
+            message = self._read_renderer_message(process)
+            if message.get("event") == "ready":
+                return process
+
+    def _read_renderer_message(
+        self, process: subprocess.Popen[str]
+    ) -> dict[str, Any]:
+        if process.stdout is None:
+            raise RendererWorkerDied("Renderer worker stdout is unavailable")
+        while True:
+            line = process.stdout.readline()
+            if line == "":
+                returncode = process.poll()
+                details = "\n".join(self._renderer_logs)
+                raise RendererWorkerDied(
+                    f"Renderer worker exited with status {returncode}.\n{details}"
+                )
+            line = line.rstrip()
+            if line.startswith("AVTR_WORKER_JSON:"):
+                try:
+                    return json.loads(line.removeprefix("AVTR_WORKER_JSON:"))
+                except json.JSONDecodeError as exc:
+                    raise RendererWorkerDied(
+                        f"Renderer worker sent invalid protocol data: {line}"
+                    ) from exc
+            self._renderer_logs.append(line)
+            print(f"[renderer] {line}", flush=True)
 
     def turn(
         self,
         question_audio: str | None,
         state: dict[str, Any] | None,
+        language: str,
         cfg_self_audio: float,
         noise_trunc_z: float,
         progress: gr.Progress = gr.Progress(),
@@ -275,19 +427,25 @@ module.main()
             raise gr.Error("Enroll a portrait and voice before starting a conversation.")
         if not question_audio:
             raise gr.Error("Record a question first.")
+        language_config = LANGUAGES.get(language)
+        if language_config is None:
+            raise gr.Error(f"Unsupported language: {language}")
+        language_code = language_config["code"]
 
         # AVTR/TensorRT and the conversational models all share one GPU.
         with self._gpu_lock:
             try:
                 self._load_models(progress)
                 progress(0.28, desc="Transcribing your question")
-                question = self._transcribe(question_audio)
+                question = self._transcribe(question_audio, language_code)
                 if not question:
                     raise gr.Error("No speech was detected. Please record the question again.")
 
                 progress(0.42, desc="Writing a response")
                 history = list(state.get("history", []))[-8:]
-                reply = self._respond(question, history)
+                reply = self._respond(
+                    question, history, language_config["instruction"]
+                )
                 if not reply:
                     raise RuntimeError("The language model returned an empty reply")
 
@@ -297,13 +455,19 @@ module.main()
                 reply_video = session_dir / f"reply_{turn_number:03d}.mp4"
 
                 progress(0.58, desc="Cloning the voice")
-                self._synthesize(reply, state["voice_reference"], reply_audio)
+                self._synthesize(
+                    reply,
+                    state["voice_reference"],
+                    reply_audio,
+                    language_code,
+                )
                 gc.collect()
                 torch.cuda.empty_cache()
 
                 progress(0.72, desc="Rendering the avatar video")
                 self._render(
                     avatar_id=state["avatar_id"],
+                    portrait=Path(state["registered_portrait"]),
                     speech=reply_audio,
                     output=reply_video,
                     cfg_self_audio=cfg_self_audio,
@@ -363,6 +527,15 @@ def build_ui(server: AvatarServer) -> gr.Blocks:
             saved_voice = gr.Audio(label="Saved voice reference", interactive=False)
 
         with gr.Tab("2. Conversation"):
+            language = gr.Radio(
+                choices=list(LANGUAGES),
+                value="English",
+                label="Conversation language / Gesprekstaal",
+            )
+            gr.Markdown(
+                "Use a voice-reference recording in the selected language for the "
+                "most natural accent. Switching languages does not reload AVTR or Qwen."
+            )
             question_audio = gr.Audio(
                 label="Record a question",
                 sources=["microphone", "upload"],
@@ -394,7 +567,7 @@ def build_ui(server: AvatarServer) -> gr.Blocks:
         )
         ask_button.click(
             server.turn,
-            inputs=[question_audio, state, cfg_self_audio, noise_trunc_z],
+            inputs=[question_audio, state, language, cfg_self_audio, noise_trunc_z],
             outputs=[transcript, response, response_audio, response_video, chat, state],
             concurrency_limit=1,
             api_visibility="private",
@@ -417,7 +590,7 @@ def parse_args() -> argparse.Namespace:
         "--work-dir", type=Path, default=Path("/content/avtr_gradio_sessions")
     )
     parser.add_argument("--llm-model", default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--stt-model", default="small.en")
+    parser.add_argument("--stt-model", default="small")
     parser.add_argument("--no-share", action="store_true")
     return parser.parse_args()
 

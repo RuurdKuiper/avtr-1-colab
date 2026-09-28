@@ -31,13 +31,14 @@ requires TRT (run ``scripts/build_avtr1_engines.py`` before first use).
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 
 from avtr1_renderer.avtr1_artifact_manager import (
-    find_engine_or_onnx,
     get_artifact_manager,
-    get_trt_engine_path, get_storage_root,
+    get_trt_engine_path,
+    get_storage_root,
 )
 from avtr1_renderer.avatar_loader import Avatar
 from avtr1_renderer.backgrounds import load_background
@@ -63,6 +64,9 @@ from avtr1_renderer.runtime import load_engine
 
 from avtr1_renderer.types import Chunk, FrameIterator, RenderOptions
 
+if TYPE_CHECKING:
+    from avtr1_renderer.avatar_loader import AvatarLoader
+
 # Reserved sentinel: skip bg compositing so callers receive raw foreground + matte.
 # Pair with ``yuv_i420_stacked_alpha`` for clean transparency.
 TRANSPARENT_BG_ID = "transparent"
@@ -80,12 +84,14 @@ class Pipeline[StateT]:
         decoder: DecoderEngine,
         matting: MODNetEngine,
         backgrounds: dict[str, torch.Tensor],
+        avatar_loader: AvatarLoader | None = None,
     ) -> None:
         self._motion_generator = motion_generator
         self._stitch = stitch
         self._warp = warp
         self._decoder = decoder
         self._matting = matting
+        self._avatar_loader = avatar_loader
         if not backgrounds:
             raise ValueError("backgrounds registry is empty")
         self._backgrounds = backgrounds
@@ -105,12 +111,9 @@ class Pipeline[StateT]:
         Downloads any missing artifacts from HuggingFace, then wires the full
         speech-to-motion + renderer stack.
 
-        TRT engines built by ``scripts/build_*.py`` are used automatically when
-        present in ``get_local_engine_dir()``.  For every renderer model the
-        pipeline falls back to ONNX Runtime if the TRT engine is absent.
-
-        AVTR1 (speech decoder) requires TRT engines — run
-        ``scripts/build_avtr1_engines.py`` before calling this method.
+        The AVTR1 motion, renderer, and HuBERT TensorRT engines must be built
+        for the current GPU before calling this method. The remaining portable
+        face-registration models run through ONNX Runtime.
 
         Args:
             avatar_ids:       Portrait IDs to pre-load (stem of ``{id}.png`` in
@@ -161,44 +164,59 @@ class Pipeline[StateT]:
             get_storage_root() / "avtr1_normalizer.safetensors"
         )
 
-        # --- Hubert: TRT if built, else ONNX --------------------------------
-        hubert = load_engine(
-            find_engine_or_onnx("hubert_lbs", "hubert_onnx"),
-            HubertInput,
-            HubertOutput,
-        )
+        # --- HuBERT TRT engine (required) -----------------------------------
+        # The ONNX export has a dynamic last_hidden_state length, while the
+        # zero-copy ORT wrapper needs outputs to be preallocated. Keep HuBERT
+        # on its supported TRT path instead of failing on the first chunk.
+        hubert_path = get_trt_engine_path("hubert_lbs")
+        if not hubert_path.is_file():
+            raise RuntimeError(
+                "HuBERT TRT engine not found.\n"
+                "Run: pixi run build-trt-engines-hubert\n"
+                f"Expected file:\n  {hubert_path}"
+            )
+        hubert = load_engine(hubert_path, HubertInput, HubertOutput)
 
-        # --- Renderer engines: TRT if built, else ONNX ----------------------
+        # --- Renderer TRT engines (required) --------------------------------
+        # The portable ONNX files are build inputs, not runtime fallbacks. In
+        # particular, warp_network.onnx contains the custom GridSample3D op,
+        # which stock ONNX Runtime cannot load. The remaining renderer graphs
+        # also need the batch-dynamic surgery performed by the TRT builder.
+        renderer_paths = {
+            "decoder": get_trt_engine_path("decoder"),
+            "warp_network": get_trt_engine_path("warp_network"),
+            "stitch_network": get_trt_engine_path("stitch_network"),
+            "modnet": get_trt_engine_path("modnet"),
+        }
+        missing_renderer_paths = [
+            path for path in renderer_paths.values() if not path.is_file()
+        ]
+        if missing_renderer_paths:
+            missing = "\n".join(f"  {path}" for path in missing_renderer_paths)
+            raise RuntimeError(
+                "Renderer TRT engines not found.\n"
+                "Run: pixi run build-trt-engines-renderer\n"
+                f"Missing files:\n{missing}"
+            )
+
         decoder = load_engine(
-            find_engine_or_onnx("decoder", "decoder_onnx"),
-            DecoderInput,
-            DecoderOutput,
+            renderer_paths["decoder"], DecoderInput, DecoderOutput
         )
 
-        # Warp needs the grid-sample plugin when running in TRT mode.
-        warp_trt = get_trt_engine_path("warp_network")
-        if warp_trt.is_file():
-            plugin_path = mgr.storage_path("warp_plugin")
-            warp = load_engine(
-                warp_trt, WarpInput, WarpOutput,
-                plugin_files=[str(plugin_path)] if plugin_path.is_file() else [],
-            )
-        else:
-            warp = load_engine(
-                find_engine_or_onnx("warp_network", "warp_network_onnx"),
-                WarpInput,
-                WarpOutput,
-            )
+        # Warp needs the grid-sample plugin in addition to its TRT engine.
+        plugin_path = mgr.storage_path("warp_plugin")
+        warp = load_engine(
+            renderer_paths["warp_network"],
+            WarpInput,
+            WarpOutput,
+            plugin_files=[str(plugin_path)] if plugin_path.is_file() else [],
+        )
 
         stitch = load_engine(
-            find_engine_or_onnx("stitch_network", "stitch_network_onnx"),
-            StitchInput,
-            StitchOutput,
+            renderer_paths["stitch_network"], StitchInput, StitchOutput
         )
         matting = load_engine(
-            find_engine_or_onnx("modnet", "modnet_onnx"),
-            MODNetInput,
-            MODNetOutput,
+            renderer_paths["modnet"], MODNetInput, MODNetOutput
         )
 
         # --- AvatarLoader (ONNX, GPU-independent) ----------------------------
@@ -248,9 +266,22 @@ class Pipeline[StateT]:
                 decoder=decoder,
                 matting=matting,
                 backgrounds=backgrounds,
+                avatar_loader=loader,
             ),
             registry,
         )
+
+    def load_avatar(self, portrait_path: Path | str, *, avatar_id: str) -> Avatar:
+        """Register another portrait without rebuilding the inference pipeline."""
+        if self._avatar_loader is None:
+            raise RuntimeError(
+                "This Pipeline has no AvatarLoader; construct it with "
+                "Pipeline.from_artifacts() or pass avatar_loader=..."
+            )
+        portrait = Path(portrait_path)
+        if not portrait.is_file():
+            raise FileNotFoundError(f"No portrait at {portrait}")
+        return self._avatar_loader.load(portrait, avatar_id=avatar_id)
 
     def initial_state(self, avatar: Avatar) -> StateT:
         return self._motion_generator.initial_state(avatar)

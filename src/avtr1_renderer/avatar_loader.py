@@ -139,6 +139,31 @@ def _check_resize(h: int, w: int, max_dim: int = 1920, division: int = 2) -> tup
     return new_h, new_w, rsz
 
 
+def _resize_cover_center(
+    img: np.ndarray, out_h: int, out_w: int
+) -> np.ndarray:
+    """Resize without distortion, then center-crop to ``(out_h, out_w)``.
+
+    This is CSS ``object-fit: cover`` semantics. It preserves the portrait's
+    aspect ratio while still producing the fixed 16:9 frame expected by the
+    renderer. Directly resizing a 4:3 webcam capture to 16:9 makes the face
+    appear unnaturally short and wide.
+    """
+    h, w = img.shape[:2]
+    if (h, w) == (out_h, out_w):
+        return img
+
+    scale = max(out_w / w, out_h / h)
+    resized_w = max(out_w, int(round(w * scale)))
+    resized_h = max(out_h, int(round(h * scale)))
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(img, (resized_w, resized_h), interpolation=interpolation)
+
+    left = (resized_w - out_w) // 2
+    top = (resized_h - out_h) // 2
+    return np.ascontiguousarray(resized[top : top + out_h, left : left + out_w])
+
+
 def _img_crop_to_bchw256(img_crop: np.ndarray) -> np.ndarray:
     """Resize a 512 (or arbitrary) crop to a (1, 3, 256, 256) float32 [0, 1]
     blob. Uses cv2.INTER_AREA -- same as the reference -- because we're
@@ -338,7 +363,7 @@ class AvatarLoader:
             img = cv2.resize(img, (new_w, new_h))
         h, w = img.shape[:2]
         if h != self.out_h or w != self.out_w:
-            img = cv2.resize(img, (self.out_w, self.out_h))
+            img = _resize_cover_center(img, self.out_h, self.out_w)
             h, w = self.out_h, self.out_w
 
         # Auto-detect matting regime from channels:

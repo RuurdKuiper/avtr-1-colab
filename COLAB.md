@@ -24,28 +24,33 @@ turns. If you prefer to inspect and run every stage separately, use:
    hidden password prompt.
 
 The notebook clones a fresh upstream checkout into `/content`, installs the
-locked pixi environments, downloads the gated weights, and builds the two
-mandatory AVTR-1 TensorRT motion engines for the assigned GPU. Renderer and
-HuBERT models use their CUDA ONNX Runtime fallbacks by default; the notebook
-offers a switch for a slower full TensorRT build when repeated-render speed is
-more important than setup time. It then lets you capture a portrait with the
+locked pixi environments, downloads the gated weights, and builds all seven
+required TensorRT engines for the assigned GPU: two AVTR-1 motion engines, four
+renderer engines, and HuBERT. The renderer's warp graph contains a custom
+`GridSample3D` operation, and the HuBERT ONNX export has a dynamic output shape,
+so neither currently has a viable ONNX Runtime fallback. It then lets you
+capture a portrait with the
 laptop camera and record speech through the browser before rendering and
 previewing the resulting MP4. File upload remains available as a fallback when
 camera access is unavailable.
 
 An optional final section turns the offline renderer into a fully local,
 turn-by-turn conversational prototype. It records a question in the browser,
-transcribes it with faster-whisper, generates a short reply with Qwen3-1.7B,
-synthesizes that reply in the recorded voice with Chatterbox Turbo, and feeds
-the result back through AVTR-1. These models run in the Colab runtime and do
-not call hosted inference APIs. The first conversational turn downloads the
-additional model weights and is therefore substantially slower than later
-turns.
+transcribes it with multilingual faster-whisper, generates a short reply with
+Qwen3-1.7B, synthesizes that reply in the recorded voice with Chatterbox
+Multilingual V3, and feeds the result back through AVTR-1. These models run in
+the Colab runtime and do not call hosted inference APIs. The interface switches
+between English and Dutch without reloading Qwen or AVTR. The first
+conversational turn loads the already-downloaded models into GPU memory and is
+therefore substantially slower than later turns.
 
 The Gradio notebook wraps the same stages in one persistent server and keeps
-the speech, language, and voice models warm between turns. Its share URL is a
-tunnel to the current Colab process, not a deployment: it stops when the cell
-or runtime stops. Browser media passes through the Gradio share tunnel to the
+the speech, language, voice, and AVTR renderer models warm between turns. AVTR
+runs in a persistent isolated Pixi worker: the first answer loads its pipeline
+and registers the portrait, while later answers reuse both. A new enrollment is
+registered on demand without rebuilding the pipeline. Its share URL is a tunnel
+to the current Colab process, not a deployment: it stops when the cell or
+runtime stops. Browser media passes through the Gradio share tunnel to the
 Colab runtime, so use the generated password and do not treat the URL as a
 private production endpoint.
 
