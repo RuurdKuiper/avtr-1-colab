@@ -34,6 +34,17 @@ laptop camera and record speech through the browser before rendering and
 previewing the resulting MP4. File upload remains available as a fallback when
 camera access is unavailable.
 
+The Gradio notebook mounts Google Drive by default and persists the seven
+TensorRT engines plus the AVTR normalizer under
+`MyDrive/avtr1-engine-cache/`. Active engines are restored into fast local
+`/content` storage rather than loaded directly from Drive. Cache directories
+are keyed by GPU name, compute capability, exact TensorRT version, and the
+engine-builder source fingerprint; incomplete caches are ignored. The first
+compatible run still builds and uploads the engines, while later fresh Colab
+runtimes restore them. Set the optional Colab secret `AVTR_DRIVE_CACHE` to
+`false` to disable Drive mounting and use ephemeral storage only. A different
+GPU or TensorRT version intentionally creates a separate cache.
+
 An optional final section turns the offline renderer into a fully local,
 turn-by-turn conversational prototype. It records a question in the browser,
 transcribes it with multilingual faster-whisper, generates a short reply with
