@@ -23,7 +23,7 @@ turns. If you prefer to inspect and run every stage separately, use:
 4. Add the token to Colab secrets as `HF_TOKEN`, or enter it in the notebook's
    hidden password prompt.
 
-The notebook clones a fresh upstream checkout into `/content`, installs the
+The notebook clones a fresh repository checkout into `/content`, installs the
 locked pixi environments, downloads the gated weights, and builds all seven
 required TensorRT engines for the assigned GPU: two AVTR-1 motion engines, four
 renderer engines, and HuBERT. The renderer's warp graph contains a custom
@@ -33,6 +33,11 @@ capture a portrait with the
 laptop camera and record speech through the browser before rendering and
 previewing the resulting MP4. File upload remains available as a fallback when
 camera access is unavailable.
+
+This fork's notebook clones `RuurdKuiper/avtr-1-colab` by default so the kiosk
+and local conversational server are present. The optional `AVTR_REPO_URL`
+Colab secret overrides that URL; remove an old secret that still points to
+`avaturn-live/avtr-1`, or update it to the fork URL.
 
 The Gradio notebook mounts Google Drive by default and persists the seven
 TensorRT engines plus the AVTR normalizer under
